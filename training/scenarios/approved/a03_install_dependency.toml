@@ -6,6 +6,15 @@ timeout_s = 900
 prompt = """Create a Python virtual environment at .venv in this directory, install the `tabulate` package \
 from PyPI into it, add `tabulate` to requirements.txt, and write a script report.py that prints \
 inventory.core.SAMPLE as a table using tabulate. Run it with .venv/bin/python report.py to confirm it works."""
+# Shown only to human runs (the brief on your terminal). Agents never see it.
+human_hint = """# python3 -m venv .venv
+# .venv/bin/pip install tabulate
+# echo tabulate >> requirements.txt
+# nano report.py           — write:
+#   from tabulate import tabulate
+#   from inventory.core import SAMPLE
+#   print(tabulate([(i.name, i.price, i.qty) for i in SAMPLE], headers=["name", "price", "qty"]))
+# .venv/bin/python report.py"""
 scope = ["inventory/**", "requirements.txt", "report.py", ".venv/**"]
 script = """
 PY="${UMBRA_PY:-python3}"

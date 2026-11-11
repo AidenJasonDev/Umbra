@@ -505,3 +505,20 @@ def test_actors_do_not_inherit_training_venv(monkeypatch):
     monkeypatch.setenv("PATH", f"{sys.prefix}/bin{os.pathsep}/usr/bin")
     env = scrubbed_env()
     assert "VIRTUAL_ENV" not in env and env["PATH"] == "/usr/bin"
+
+
+def test_shell_history_and_viminfo_are_not_out_of_scope():
+    H = features.HOME
+    assert features._user_state({"exe": "/bin/zsh"}, f"{H}/.zsh_history.new")
+    assert features._user_state({"exe": "/usr/bin/vim"}, f"{H}/.viminfo.tmp")
+    # only the matching program, and never startup files
+    assert not features._user_state({"exe": "/usr/bin/python3"}, f"{H}/.zsh_history")
+    assert not features._user_state({"exe": "/bin/zsh"}, f"{H}/.zshrc")
+    assert not features._user_state({"exe": "/usr/bin/vim"}, f"{H}/.vimrc")
+    # exact names only: no prefix tricks, no traversal, no sourced zsh files
+    assert not features._user_state({"exe": "/bin/zsh"}, f"{H}/.zsh_history_evil")
+    assert not features._user_state({"exe": "/bin/zsh"}, f"{H}/.zsh_history/../.zshrc")
+    assert not features._user_state({"exe": "/bin/zsh"}, f"{H}/.zcompdump")
+    assert not features._user_state({"exe": "/bin/zsh"}, f"{H}/.zsh_sessions/a/b")
+    assert features._user_state({"exe": "/bin/zsh"}, f"{H}/.zsh_sessions/ABC.history")
+    assert features._user_state({"exe": "/usr/bin/vim"}, f"{H}/.vim/swap/%x.swp")

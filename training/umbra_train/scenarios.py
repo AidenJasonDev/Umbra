@@ -23,6 +23,7 @@ class Scenario:
     timeout_s: int
     scope: list[str]
     checks: list[dict] = field(default_factory=list)
+    human_hint: str = ""  # commented walkthrough printed only on human runs
     source: Path | None = None
 
 
@@ -38,6 +39,7 @@ def _load(path: Path) -> Scenario:
         timeout_s=int(raw.get("timeout_s", 600)),
         scope=list(raw.get("scope", [])),
         checks=list(raw.get("check", [])),
+        human_hint=raw.get("human_hint", "").strip("\n"),
         source=path,
     )
     validate(sc)

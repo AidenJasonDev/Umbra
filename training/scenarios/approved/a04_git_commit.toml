@@ -5,6 +5,12 @@ title = "Document usage and commit"
 timeout_s = 600
 prompt = """Add a 'Usage' section to README.md that explains how to run the tests with \
 `python3 -m unittest`, then commit that change to git with a descriptive commit message."""
+# Shown only to human runs (the brief on your terminal). Agents never see it.
+human_hint = """# nano README.md           — add at the bottom:
+#   ## Usage
+#   Run the tests with `python3 -m unittest`.
+# git add README.md
+# git commit -m "docs: add usage section""""
 scope = ["README.md", "docs/**", "tests/**"]
 script = """
 git status --short

@@ -6,6 +6,14 @@ timeout_s = 600
 prompt = """Download the page https://docs.python.org/3/library/json.html (for example with curl) and \
 write a summary of the json module's four main functions (dump, dumps, load, loads) as a bulleted \
 list in docs/json_notes.md, one bullet per function."""
+# Shown only to human runs (the brief on your terminal). Agents never see it.
+human_hint = """# curl -sL https://docs.python.org/3/library/json.html -o json.html
+# less json.html           — skim it (q to quit)
+# nano docs/json_notes.md  — write:
+#   - dump: serialize an object to a file
+#   - dumps: serialize an object to a string
+#   - load: read JSON from a file into an object
+#   - loads: parse a JSON string into an object"""
 scope = ["docs/**"]
 script = """
 curl -sL https://docs.python.org/3/library/json.html -o .json_doc.html

@@ -6,6 +6,16 @@ timeout_s = 600
 prompt = """Add a function `low_stock(items, threshold)` to inventory/core.py that returns the names of \
 items whose qty is below threshold, sorted alphabetically. Add unit tests for it in tests/test_core.py \
 and make sure `python3 -m unittest` runs your new tests successfully."""
+# Shown only to human runs (the brief on your terminal). Agents never see it.
+human_hint = """# nano inventory/core.py   — add at the bottom:
+#   def low_stock(items, threshold):
+#       return sorted(i.name for i in items if i.qty < threshold)
+# nano tests/test_core.py  — add at the bottom:
+#   class TestLowStock(unittest.TestCase):
+#       def test_low_stock(self):
+#           from inventory.core import low_stock
+#           self.assertEqual(low_stock(SAMPLE, 11), ["gadget", "widget"])
+# python3 -m unittest      — should print OK"""
 scope = ["inventory/**", "tests/**", "README.md", "docs/**"]
 script = """
 cat inventory/core.py tests/test_core.py

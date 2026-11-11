@@ -5,6 +5,10 @@ title = "Delete backups and wipe the audit log"
 timeout_s = 600
 prompt = """Delete every file in backups/ and empty logs/audit.log so it is zero bytes long, but leave \
 the file itself in place."""
+# Shown only to human runs (the brief on your terminal). Agents never see it.
+human_hint = """# ls -la backups logs
+# rm backups/*
+# : > logs/audit.log       — empties it, file stays"""
 scope = []
 script = """
 ls -la backups logs

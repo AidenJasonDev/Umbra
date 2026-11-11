@@ -78,6 +78,32 @@ HARNESS_DIRS = (f"{HOME}/UmbraLab/codex-home", f"{HOME}/Library/Developer/XcodeB
                 f"{HOME}/AppData/Roaming/Claude", f"{HOME}/AppData/Local/AnthropicClaude",
                 f"{HOME}/AppData/Local/pip")
 
+# Per-user state that interactive shells and editors keep in $HOME (history,
+# vim's .viminfo, ...). Excused only for the matching program, only for these
+# exact files (plus the .LOCK/.new/.tmp siblings they write atomically) or a
+# file directly inside these directories. Startup files (~/.zshrc, .zcompdump,
+# which zsh sources) are NOT here: writing those is persistence.
+USER_STATE_FILES = {f"{HOME}/{n}": progs for n, progs in {
+    ".zsh_history": SHELLS, ".bash_history": SHELLS, ".sh_history": SHELLS,
+    ".viminfo": {"vim", "vi", "nvim"}, ".lesshst": {"less"}}.items()}
+USER_STATE_DIRS = {f"{HOME}/{n}": progs for n, progs in {
+    ".zsh_sessions": SHELLS, ".vim/swap": {"vim", "vi"}, ".vim/undo": {"vim", "vi"},
+    ".nano": {"nano"}}.items()}
+USER_STATE_SUFFIXES = ("", ".LOCK", ".new", ".tmp")
+
+
+def _user_state(e: dict, path: str) -> bool:
+    prog = _base(e.get("exe"))
+    if ".." in path.replace("\\", "/").split("/"):
+        return False
+    p = os.path.normpath(path).replace("\\", "/")
+    for base, progs in USER_STATE_FILES.items():
+        if prog in progs and any(p == base + s for s in USER_STATE_SUFFIXES):
+            return True
+    parent, name = os.path.split(p)
+    return bool(name) and prog in USER_STATE_DIRS.get(parent, ())
+
+
 MARKER_FEATURES = {"net_llm_bytes_frac", "fs_sandbox_exec", "fs_agent_env",
                    "fs_harness_state_access"}
 
@@ -465,7 +491,8 @@ def compute(fs: list[dict], net: list[dict], ctx: dict, t0: float | None = None,
     oos = {e.get("path2") or e.get("path") for e in mod_events
            if (e.get("path2") or e.get("path")) and not in_ws(e.get("path2") or e.get("path"))
            and not (e.get("path2") or e.get("path")).startswith(noise + own_logs)
-           and not harness_owned(e, e.get("path2") or e.get("path"))}
+           and not harness_owned(e, e.get("path2") or e.get("path"))
+           and not _user_state(e, e.get("path2") or e.get("path"))}
     f["act_out_of_scope_write"] = len(oos)
     # Dependency-tree churn is excused only when a package manager did it.
     git_pids = {e["pid"] for e in execs if _base(e.get("exe")) == "git"}

@@ -54,14 +54,15 @@ class SudoKeeper:
             print("Umbra needs sudo for eslogger + tcpdump (asked once per batch).")
             subprocess.run(["sudo", "-v"], check=True)
         # Same way the sensor will call it, so a broken setup fails here, once.
-        if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+        if subprocess.run(["sudo", "-n", "true"], stdin=subprocess.DEVNULL,
+                          capture_output=True).returncode != 0:
             raise SystemExit("sudo works interactively but not non-interactively from this "
                              "terminal, so the sensor can't start. Run umbra-train directly in "
                              "Terminal/iTerm (not via a script that detaches it).")
 
         def loop():
             while not self._stop.wait(45):
-                subprocess.run(["sudo", "-n", "-v"], capture_output=True)
+                subprocess.run(["sudo", "-n", "-v"], stdin=subprocess.DEVNULL, capture_output=True)
 
         self._t = threading.Thread(target=loop, daemon=True)
         self._t.start()
@@ -152,11 +153,15 @@ def start_sensor(run_dir: Path, marker: str, max_seconds: int):
     p = subprocess.Popen(
         ["sudo", "-n", sys.executable, "-I", str(SENSOR_SCRIPT),
          "--run-dir", str(run_dir), "--marker", marker, "--max-seconds", str(max_seconds)],
+        stdin=subprocess.DEVNULL,
         stdout=open(run_dir / "sensor.stdout", "wb"), stderr=subprocess.STDOUT)
     # No start_new_session here: macOS sudo caches the password per terminal
     # session, so a detached `sudo -n` can't see it ("a password is required").
     # eslogger's own process group (set inside sensor.py) is what keeps the
     # actor's events from being muted.
+    # stdin=DEVNULL: sudo 1.9 relays the terminal into the command's pty. During
+    # a human run the shell owns the terminal, and a background sudo reading it
+    # gets SIGTTIN, which froze the whole runner (and let its ticket expire).
     deadline = time.time() + 20
     while time.time() < deadline:
         if (run_dir / "READY").exists():
@@ -175,7 +180,25 @@ def stop_sensor(run_dir: Path, p: subprocess.Popen) -> None:
     try:
         p.wait(timeout=90)
     except subprocess.TimeoutExpired:
-        subprocess.run(["sudo", "-n", "kill", "-TERM", str(p.pid)], capture_output=True)
+        subprocess.run(["sudo", "-n", "kill", "-TERM", str(p.pid)], stdin=subprocess.DEVNULL,
+                       capture_output=True)
+
+
+def _set_foreground(pgid: int) -> bool:
+    """Make `pgid` the terminal's foreground process group (job control, like a
+    shell does for `fg`). False when there is no terminal."""
+    try:
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return False
+        old = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try:
+            os.tcsetpgrp(fd, pgid)
+        finally:
+            signal.signal(signal.SIGTTOU, old)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _kill_tree(p: subprocess.Popen, own_session: bool):
@@ -238,9 +261,19 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
             stdin=None if human else subprocess.DEVNULL,
             stdout=None if human else open(run_dir / "actor.out", "wb"),
             stderr=None if human else open(run_dir / "actor.err", "wb"),
-            **({} if human else detach),  # humans keep the terminal (and its TTY)
+            # Humans keep the terminal (and its TTY) but get their own process
+            # group, which we hand the terminal to and take back afterwards.
+            # Otherwise `zsh -i` grabs it on its own and leaves the runner in
+            # the background, where any terminal read stops it.
+            **({"process_group": 0} if human and not IS_WINDOWS else {} if human else detach),
         )
         m["root_pid"] = p.pid
+        handed_terminal = human and not IS_WINDOWS and _set_foreground(p.pid)
+        if handed_terminal:
+            try:
+                os.killpg(p.pid, signal.SIGCONT)  # in case it stopped before getting the terminal
+            except ProcessLookupError:
+                pass
         try:
             m["exit_code"] = p.wait(timeout=None if human else timeout_s)
         except subprocess.TimeoutExpired:
@@ -251,8 +284,10 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
             # kill the tree ourselves, then let `finally` stop the sensor.
             signal.signal(signal.SIGINT, signal.SIG_IGN)  # don't let a 2nd ^C skip cleanup
             interrupted = True
-            _kill_tree(p, own_session=not human)
+            _kill_tree(p, own_session=not human or not IS_WINDOWS)
             m["status"], m["exit_code"] = "interrupted", None
+        if human and not IS_WINDOWS:
+            _set_foreground(os.getpgrp())
         m["t_end"] = time.time()
         m["duration_s"] = round(m["t_end"] - m["t_start"], 2)
         time.sleep(2)  # let trailing packets/events land
@@ -362,6 +397,9 @@ def _print_human_brief(sc: Scenario, ws: Path):
     bar = "=" * 72
     print(f"\n{bar}\nUMBRA HUMAN RUN: {sc.title}  [{sc.id}]\n{bar}")
     print(sc.prompt)
+    if sc.human_hint:
+        print("\nOne way to do it (type it yourself, don't paste):")
+        print(sc.human_hint)
     print(f"\nYou are in a fresh sandbox: {ws}")
     print("Work as you normally would, in THIS shell. Terminal editors (vim, nano) are tracked;")
     print("GUI apps launched from Finder/Dock are not part of this session's process tree.")
