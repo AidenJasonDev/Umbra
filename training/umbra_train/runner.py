@@ -97,24 +97,37 @@ def actor_version(actor: Actor) -> str:
 
 
 def agent_error(transcript: str) -> str | None:
-    """First fatal harness/API error in an agent's JSON output, if any."""
+    """Fatal harness/API error, taken ONLY from the CLI's final top-level JSON
+    event (Claude's `result`, Codex's `turn.failed`). Text an agent prints, or
+    an error mid-run, can't relabel the run."""
+    last = None
     for line in transcript.splitlines():
         line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        if ev.get("type") == "result" and ev.get("is_error"):
-            return str(ev.get("result") or ev.get("terminal_reason"))[:200]
-        if ev.get("type") == "turn.failed":
-            return str((ev.get("error") or {}).get("message"))[:200]
+        if line.startswith("{"):
+            try:
+                last = json.loads(line)
+            except ValueError:
+                continue
+    if not isinstance(last, dict):
+        return None
+    if last.get("type") == "result" and last.get("is_error") is True:
+        return str(last.get("result") or last.get("terminal_reason"))[:200]
+    if last.get("type") == "turn.failed" and isinstance(last.get("error"), dict):
+        return str(last["error"].get("message"))[:200]
     return None
 
 
 def scrubbed_env(extra: dict | None = None) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith(SCRUB_ENV_PREFIXES)}
+    # `uv run` puts the training virtualenv first on PATH. Actors must get the
+    # machine's own python, not ours (it was compiling bytecode into uv's
+    # interpreter, showing up as out-of-scope writes).
+    venv = os.environ.get("VIRTUAL_ENV") or sys.prefix
+    for k in ("VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "PYTHONHOME", "PYTHONPATH", "UV_RUN_RECURSION_DEPTH"):
+        env.pop(k, None)
+    env = {k: v for k, v in env.items() if not k.startswith("UV_")}
+    env["PATH"] = os.pathsep.join(d for d in env.get("PATH", "").split(os.pathsep)
+                                  if d and not d.startswith(venv))
     env.update(extra or {})
     return env
 
@@ -280,7 +293,10 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
         for name in ("actor.out", "actor.err"):
             if (run_dir / name).exists():
                 transcript += (run_dir / name).read_text(errors="replace")[-20000:]
-        err = agent_error(transcript) if actor.is_agent else None
+        # Only a run that achieved nothing can be relabeled as a provider refusal
+        # or a broken agent; if any check passed, the actions happened and the
+        # run stays in the data whatever the agent printed.
+        err = agent_error(transcript) if (actor.is_agent and m["checks_passed"] == 0) else None
         if err and any(k in err.lower() for k in ("safeguard", "usage policy", "flagged")):
             # The provider's safety layer blocked the request: that's a refusal,
             # and a real agent behavior worth keeping, not a broken run.
@@ -294,7 +310,7 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
             m["notes"] = (err or f"agent exited {m.get('exit_code')}")[:300]
         if m["checks_passed"] == m["checks_total"]:
             m["outcome"] = "completed"
-        elif actor.is_agent and (m.get("refused_by_provider") or looks_refused(transcript)):
+        elif actor.is_agent and m["checks_passed"] == 0 and (m.get("refused_by_provider") or looks_refused(transcript)):
             m["outcome"] = "refused"
         else:
             m["outcome"] = "not_completed"

@@ -101,8 +101,17 @@ def responses(pkts: list[dict]) -> list[dict]:
 streams = responses  # older name, still used by features.py
 
 
-def inbound_times(pkts: list[dict]) -> list[float]:
-    return sorted(p["t"] for p in pkts if p["dir"] == "in" and p["len"] > 0 and _model_flow(p))
+def model_flows(pkts: list[dict]) -> set:
+    """Connections that carried at least one upload burst (>=1 KB). That's
+    what a model conversation looks like; a download, a git fetch or an idle
+    keep-alive on port 443 doesn't qualify."""
+    return {u["flow"] for u in uploads(pkts)}
+
+
+def inbound_times(pkts: list[dict], flows: set | None = None) -> list[float]:
+    flows = model_flows(pkts) if flows is None else flows
+    return sorted(p["t"] for p in pkts if p["dir"] == "in" and p["len"] > 0 and _model_flow(p)
+                  and _flow(p) in flows)
 
 
 def commands(fs: list[dict], root_pid: int | None) -> list[dict]:
@@ -147,15 +156,16 @@ def cycles(fs: list[dict], net: list[dict], root_pid: int | None) -> dict:
     Claude's chunky responses and Codex's always-busy connection.
     """
     ups = uploads(net)
-    resp = responses(net)
+    mflows = {u["flow"] for u in ups}
+    resp = [r for r in responses(net) if r["flow"] in mflows]
     cmds = commands(fs, root_pid)
-    in_t = inbound_times(net)
+    in_t = inbound_times(net, mflows)
     up_t = [u["t"] for u in ups]
     up_end = sorted(u["end"] for u in ups)
     cmd_end = sorted(c["end"] for c in cmds if c["end"] is not None)
     in_by_flow: dict = {}
     for p in net:
-        if p["dir"] == "in" and p["len"] > 0 and _model_flow(p):
+        if p["dir"] == "in" and p["len"] > 0 and _model_flow(p) and _flow(p) in mflows:
             in_by_flow.setdefault(_flow(p), []).append(p["t"])
     for v in in_by_flow.values():
         v.sort()

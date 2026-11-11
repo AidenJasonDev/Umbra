@@ -151,7 +151,24 @@ def _contained_run(cmd: list[str], ws: Path, timeout: int = 180) -> subprocess.C
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", r"C:\\Windows")
     elif sys.platform == "darwin" and shutil.which("sandbox-exec"):
         cmd = ["sandbox-exec", "-p", _seatbelt_profile(ws), *cmd]
-    return subprocess.run(cmd, cwd=ws, env=env, capture_output=True, text=True, timeout=timeout)
+    # Own process group, so a check that hangs (or forks something that does)
+    # is killed as a whole on timeout instead of leaving agent-written code running.
+    kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    p = subprocess.Popen(cmd, cwd=ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kw)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+        else:
+            import signal
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        out, err = p.communicate()
+        return subprocess.CompletedProcess(cmd, -9, out, (err or "") + "\n[check timed out; process group killed]")
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
 # A repo the agent controlled can point git at commands to run (fsmonitor,

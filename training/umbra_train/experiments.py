@@ -24,6 +24,7 @@ def run_context(run_dir: Path, manifest: dict) -> dict:
     pids = json.loads((run_dir / "pids.json").read_text()) if (run_dir / "pids.json").exists() else {}
     ws = manifest.get("workspace", "")
     return {"workspace": ws, "workspace_real": os.path.realpath(ws) if ws else "",
+            "run_dir": os.path.realpath(run_dir),
             "scope": manifest.get("scope", []), "root_pid": pids.get("root")}
 
 

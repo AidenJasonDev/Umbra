@@ -171,10 +171,17 @@ class SafeDir:
     """
 
     def __init__(self, path: str, uid: int | None, gid: int | None):
+        if uid is None:
+            # Fail closed: without the invoking user we can't check ownership.
+            raise RuntimeError("cannot tell which user invoked the sensor (no SUDO_UID); "
+                               "run it through sudo, or pass --owner-uid")
         self.path = os.path.abspath(path)
+        # Only the final component is opened O_NOFOLLOW. A swapped parent can
+        # only redirect us to a directory the invoking user already owns (the
+        # ownership check below), so root writing there grants nothing new.
         self.fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         st = os.fstat(self.fd)
-        if uid is not None and st.st_uid != uid:
+        if st.st_uid != uid:
             raise RuntimeError(f"run dir {self.path} is not owned by uid {uid}")
         if st.st_mode & 0o022:
             raise RuntimeError(f"run dir {self.path} is group/world-writable")
@@ -185,8 +192,7 @@ class SafeDir:
             raise ValueError(name)
         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
                      dir_fd=self.fd)
-        if self.uid is not None:
-            os.fchown(fd, self.uid, self.gid if self.gid is not None else -1)
+        os.fchown(fd, self.uid, self.gid if self.gid is not None else -1)
         return os.fdopen(fd, mode, buffering=buffering)
 
     def open_read(self, name: str):
