@@ -128,8 +128,13 @@ def stop_pktmon(etl: Path, pcap: Path) -> None:
 
 def export_4688(since_utc: str, out_xml: Path) -> None:
     q = (f"*[System[(EventID=4688) and TimeCreated[@SystemTime>='{since_utc}']]]")
-    p = _run(["wevtutil", "qe", "Security", f"/q:{q}", "/f:xml", "/e:Events"], check=False)
-    out_xml.write_text(p.stdout or "<Events/>")
+    # /uni:true -> UTF-16. Without it wevtutil writes the ANSI code page (an em
+    # dash in a command line comes out as 0x97 and breaks the UTF-8 XML parse;
+    # anything outside that code page becomes '?').
+    p = subprocess.run(["wevtutil", "qe", "Security", f"/q:{q}", "/f:xml", "/e:Events", "/uni:true"],
+                       capture_output=True)
+    text = p.stdout.decode("utf-16", errors="replace").lstrip("﻿") if p.stdout else ""
+    out_xml.write_text(text if text.strip() else "<Events/>", encoding="utf-8")
 
 
 def etl_to_xml(etl: Path, out_xml: Path) -> None:
@@ -155,57 +160,106 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def parse_events_xml(path_or_text) -> list[dict]:
-    """Parse tracerpt / wevtutil XML into flat dicts:
-    {provider, id, t, pid, tid, data: {Name: value}}."""
+def _event_record(ev, pre=None, keep=None) -> dict | None:
+    """Header first (provider, id, pid); `pre(provider, pid)` can reject the
+    event before its data and timestamp are decoded, which is most of the cost
+    when 99% of a system-wide trace belongs to other processes."""
+    system = data_el = None
+    for child in ev:
+        name = _local(child.tag)
+        if name == "System":
+            system = child
+        elif name in ("EventData", "UserData"):
+            data_el = child
+    if system is None:
+        return None
+    rec: dict = {"data": {}}
+    systime = ""
+    for s in system:
+        sn = _local(s.tag)
+        if sn == "Provider":
+            rec["provider"] = s.get("Name")
+        elif sn == "EventID":
+            rec["id"] = int((s.text or "0").strip())
+        elif sn == "TimeCreated":
+            systime = s.get("SystemTime") or ""
+        elif sn == "Execution":
+            rec["pid"] = _int(s.get("ProcessID"))
+            rec["tid"] = _int(s.get("ThreadID"))
+    if "id" not in rec:
+        return None
+    if pre is not None and not pre(rec.get("provider"), rec.get("pid")):
+        return None
+    if data_el is not None:
+        for d in data_el.iter():
+            if _local(d.tag) == "Data" and d.get("Name"):
+                rec["data"][d.get("Name")] = (d.text or "").strip()
+    if keep is not None and not keep(rec):
+        return None
+    rec["t"] = parse_systime(systime)
+    return rec
+
+
+def iter_events_xml(path_or_text, keep=None, pre=None):
+    """Stream tracerpt / wevtutil XML as flat dicts:
+    {provider, id, t, pid, tid, data: {Name: value}}.
+    Streams, so a multi-GB etw.xml (system-wide Kernel-File during a pip
+    install) never sits in memory. `pre(provider, pid)` is a cheap header
+    filter; `keep(rec)` sees the decoded data (but not yet `t`)."""
+    import io
     if isinstance(path_or_text, Path):
-        text = path_or_text.read_text(encoding="utf-8", errors="replace") if path_or_text.exists() else ""
+        if not path_or_text.exists() or path_or_text.stat().st_size == 0:
+            return
+        src = open(path_or_text, "rb")
     else:
-        text = path_or_text
-    if not text.strip():
-        return []
-    # tracerpt/wevtutil never emit a DTD; refuse one so entity expansion
-    # (billion laughs) can't happen even if a file is swapped underneath us.
-    if "<!DOCTYPE" in text[:4096].upper() or "<!ENTITY" in text.upper():
-        raise ValueError("refusing XML with a DTD/entity declaration")
-    root = ET.fromstring(text)
-    events = []
-    for ev in root.iter():
-        if _local(ev.tag) != "Event":
-            continue
-        rec: dict = {"data": {}}
-        for child in ev:
-            name = _local(child.tag)
-            if name == "System":
-                for s in child:
-                    sn = _local(s.tag)
-                    if sn == "Provider":
-                        rec["provider"] = s.get("Name")
-                    elif sn == "EventID":
-                        rec["id"] = int((s.text or "0").strip())
-                    elif sn == "TimeCreated":
-                        rec["t"] = parse_systime(s.get("SystemTime") or "")
-                    elif sn == "Execution":
-                        rec["pid"] = _int(s.get("ProcessID"))
-                        rec["tid"] = _int(s.get("ThreadID"))
-            elif name in ("EventData", "UserData"):
-                for d in child.iter():
-                    if _local(d.tag) == "Data" and d.get("Name"):
-                        rec["data"][d.get("Name")] = (d.text or "").strip()
-        if "id" in rec:
-            events.append(rec)
-    return events
+        if not path_or_text.strip():
+            return
+        src = io.BytesIO(path_or_text.encode("utf-8"))
+    with src:
+        # tracerpt/wevtutil never emit a DTD; refuse one so entity expansion
+        # (billion laughs) can't happen even if a file is swapped underneath us.
+        # A DTD can only sit in the prolog, before the root element.
+        head = src.read(65536)
+        src.seek(0)
+        prolog = re.split(rb"<[A-Za-z]", head, maxsplit=1)[0].upper()
+        if b"<!DOCTYPE" in prolog or b"<!ENTITY" in prolog:
+            raise ValueError("refusing XML with a DTD/entity declaration")
+        root = None
+        for kind, el in ET.iterparse(src, events=("start", "end")):
+            if kind == "start":
+                if root is None:
+                    root = el
+                continue
+            if _local(el.tag) != "Event":
+                continue
+            rec = _event_record(el, pre, keep)
+            el.clear()
+            if root is not None:
+                root.clear()  # drop finished events so memory stays flat
+            if rec is not None:
+                yield rec
+
+
+def parse_events_xml(path_or_text, keep=None, pre=None) -> list[dict]:
+    return list(iter_events_xml(path_or_text, keep, pre))
+
+
+_SYSTIME = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)?$")
 
 
 def parse_systime(s: str) -> float:
-    """'2026-11-10T20:31:06.1234567Z' (100 ns) -> epoch seconds."""
+    """SystemTime -> epoch seconds. wevtutil writes UTC ('...06.1234567Z');
+    tracerpt writes local time with an offset ('...06.123456700-06:00').
+    Fractions go up to 9 digits, more than fromisoformat accepts."""
     if not s:
         return 0.0
-    s = s.rstrip("Z")
-    if "." in s:
-        base, frac = s.split(".", 1)
-        s = f"{base}.{frac[:6]}"
-    return datetime.fromisoformat(s + "+00:00").timestamp()
+    m = _SYSTIME.match(s.strip())
+    if not m:
+        raise ValueError(f"unrecognized SystemTime: {s!r}")
+    base, frac, tz = m.groups()
+    tz = "+00:00" if tz in (None, "Z") else tz
+    dt = datetime.fromisoformat(base + tz)
+    return dt.timestamp() + (float("0." + frac) if frac else 0.0)
 
 
 def _int(v) -> int | None:
@@ -399,7 +453,27 @@ def finish_run(run_dir: Path, root_pid: int, devmap: dict[str, str] | None = Non
     """Convert a stopped run's captures into fs.jsonl / net.jsonl / pids.json."""
     from .. import ingest  # SNI/JA4 from pktmon pcapng via tshark, same code as the Mac
 
-    events = parse_events_xml(run_dir / "etw.xml")
+    etw_xml = run_dir / "etw.xml"
+    # Pass 1: process events only (few), to learn the actor's tree.
+    # Pass 2: keep only that tree's file/network events, plus DNS for host labels.
+    total = 0
+
+    def count_procs(prov, _pid):
+        nonlocal total
+        total += 1
+        return prov == PROV_PROCESS
+    procs = parse_events_xml(etw_xml, pre=count_procs)
+    tree = build_tree(procs, root_pid)
+
+    def head_in_tree(prov, pid):
+        # Kernel-Network's header pid is often System; its real PID is in the data.
+        return prov in (PROV_PROCESS, PROV_DNS, PROV_NET) or pid in tree
+
+    def net_in_tree(rec):
+        if rec.get("provider") == PROV_NET:
+            return (_int(rec["data"].get("PID")) or rec.get("pid")) in tree
+        return True
+    events = parse_events_xml(etw_xml, keep=net_in_tree, pre=head_in_tree)
     sec = parse_events_xml(run_dir / "sec4688.xml")
     fs, net, tree = normalize(events, sec, root_pid, devmap)
     pcap = run_dir / "net.pcapng"
@@ -417,7 +491,7 @@ def finish_run(run_dir: Path, root_pid: int, devmap: dict[str, str] | None = Non
     with open(run_dir / "net.jsonl", "w") as f:
         f.writelines(json.dumps(p) + "\n" for p in net)
     (run_dir / "pids.json").write_text(json.dumps({"root": root_pid, "pids": sorted(tree)}, indent=2))
-    return {"fs_events": len(fs), "net": {"kept": len(net)}, "etw_events": len(events),
+    return {"fs_events": len(fs), "net": {"kept": len(net)}, "etw_events": total,
             "cmdlines": sum(1 for e in sec if e["id"] == 4688)}
 
 
@@ -442,13 +516,18 @@ class WindowsSensor:
         self.pktmon = start_pktmon(self.pkt_etl)
         (self.run_dir / "READY").touch()
 
-    def stop(self, root_pid: int) -> dict:
+    def stop(self, root_pid: int, keep_xml: bool = False) -> dict:
         stop_etw()
         if self.pktmon:
             stop_pktmon(self.pkt_etl, self.run_dir / "net.pcapng")
         etl_to_xml(self.etl, self.run_dir / "etw.xml")
         export_4688(self.started_utc, self.run_dir / "sec4688.xml")
-        return finish_run(self.run_dir, root_pid, device_map())
+        stats = finish_run(self.run_dir, root_pid, device_map())
+        if not keep_xml:
+            # etw.xml is ~10x the .etl (GBs for a pip install) and can be
+            # regenerated from etw.etl with etl_to_xml, so drop it once ingested.
+            (self.run_dir / "etw.xml").unlink(missing_ok=True)
+        return stats
 
 
 def doctor(run_dir: Path) -> int:
@@ -462,10 +541,15 @@ def doctor(run_dir: Path) -> int:
         print(f"FAIL  sensor start: {e}")
         return 2
     time.sleep(1)
-    p = subprocess.Popen(["curl.exe", "-s", "-o", "NUL", "-m", "8", "https://example.com/"])
+    # Write the body to a real file: `-o NUL` does no file I/O, and DLL loads
+    # are paging reads that don't count as opens, so the file check needs this.
+    out_file = (run_dir / "doctor_download.html").resolve()
+    wall_start = time.time()
+    p = subprocess.Popen(["curl.exe", "-s", "-o", str(out_file), "-m", "8", "https://example.com/"])
     p.wait()
+    wall_end = time.time()
     time.sleep(2)
-    stats = s.stop(p.pid)
+    stats = s.stop(p.pid, keep_xml=True)
     fs = [json.loads(x) for x in (run_dir / "fs.jsonl").read_text().splitlines()]
     net = [json.loads(x) for x in (run_dir / "net.jsonl").read_text().splitlines()]
     ok = True
@@ -479,7 +563,16 @@ def doctor(run_dir: Path) -> int:
            f"no ProcessStart for pid {p.pid}; {stats['etw_events']} ETW events total")
     report(any(e["k"] == "exec" and len(e.get("args") or []) > 1 for e in fs),
            "full command line from Security 4688", "no command line (4688 auditing may need a reboot or GPO)")
-    report(any(e["k"] == "open" for e in fs), "file events from Kernel-File", "no file events for curl")
+    want = out_file.as_posix().lower()
+    report(any(e["k"] in ("open", "write", "create") and (e.get("path") or "").lower() == want for e in fs),
+           f"file write to {out_file.name} from Kernel-File",
+           f"no Kernel-File write for {out_file.name}; {sum(1 for e in fs if e['k'] == 'open')} opens kept")
+    # Event times must fall inside the wall-clock span of the curl run
+    # (tracerpt's local-time offset once put them hours off and emptied every window).
+    times = [e["t"] for e in fs] + [p_["t"] for p_ in net]
+    report(bool(times) and all(wall_start - 5 <= t <= wall_end + 5 for t in times),
+           "event times match the wall clock",
+           f"event times off the wall clock by {min(times or [wall_start]) - wall_start:+.0f}s")
     report(any(p_["dir"] == "out" for p_ in net) and any(p_["dir"] == "in" for p_ in net),
            f"{len(net)} network events with PID, both directions", "no Kernel-Network send/recv for curl")
     report(any(p_.get("host") == "example.com" for p_ in net), "host labelled example.com (DNS/SNI)",

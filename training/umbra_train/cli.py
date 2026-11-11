@@ -21,14 +21,14 @@ def cmd_doctor(a):
         print("Checking the Windows sensors (ETW, Security 4688, pktmon). Needs an elevated prompt.\n")
         rc = windows.doctor(out)
         if rc == 0:
-            print("Sensors OK. Next: umbra-train run --actor script --scenario all")
+            print("Sensors OK. Next: uv run umbra-train run --actor script --scenario all")
         return rc
     print("Checking the sensors. sudo will ask for your password.\n")
     rc = subprocess.run(["sudo", sys.executable, "-I", str(SENSOR_SCRIPT), "--doctor",
                          "--run-dir", str(out)]).returncode
     print(f"\nSample output saved in {out}")
     if rc == 0:
-        print("Sensors OK. Next: umbra-train run --actor script --scenario all")
+        print("Sensors OK. Next: uv run umbra-train run --actor script --scenario all")
     return rc
 
 

@@ -82,6 +82,19 @@ def build_command(actor: Actor, sc: Scenario, lab: LabConfig) -> list[str]:
     cmd = [part.replace("{prompt}", prompt).replace("{script}", sc.script) for part in actor.cmd]
     # npm installs `codex`/`claude` as .cmd shims on Windows; resolve to a real path.
     exe = shutil.which(cmd[0])
+    if exe is None and not Path(cmd[0]).exists():
+        raise FileNotFoundError(f"{actor.name}: '{cmd[0]}' is not on PATH. Install it, or add its "
+                                f"folder to PATH (Claude Code's native installer uses ~/.local/bin).")
+    if exe and exe.lower().endswith((".cmd", ".bat")):
+        # A .cmd shim runs through cmd.exe, which ends the command at the first
+        # newline, so a multi-line prompt arrives empty or cut short. Flatten
+        # newlines, and refuse characters cmd.exe would still rewrite.
+        args = [" ".join(a.split()) if ("\n" in a or "\r" in a) else a for a in cmd[1:]]
+        bad = [c for c in '%"^' if any(c in a for a in args)]
+        if bad:
+            raise ValueError(f"{actor.name}: {exe} is a .cmd shim and the arguments contain "
+                             f"{''.join(bad)}, which cmd.exe would rewrite. Install a native .exe.")
+        return [exe, *args]
     return [exe or cmd[0], *cmd[1:]]
 
 

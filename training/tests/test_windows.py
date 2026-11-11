@@ -118,3 +118,40 @@ def test_xml_with_dtd_is_refused():
     import pytest
     with pytest.raises(ValueError):
         w.parse_events_xml('<!DOCTYPE x [<!ENTITY a "b">]><Events/>')
+
+
+def test_parse_systime_keeps_offset_and_full_fraction():
+    # wevtutil: UTC with 7-digit fraction
+    utc = w.parse_systime("2026-11-11T03:08:13.4701794Z")
+    # tracerpt: local time, 9-digit fraction, offset (real sample from a CST box)
+    local = w.parse_systime("2026-11-10T21:08:13.470179400-06:00")
+    assert abs(utc - local) < 1e-6
+    assert abs(utc - 1794366493.4701794) < 1e-6
+    assert w.parse_systime("2026-11-10T21:08:13+05:30") == w.parse_systime("2026-11-10T15:38:13Z")
+    assert w.parse_systime("") == 0.0
+
+
+def test_streaming_parse_filters_and_matches_full_parse(tmp_path):
+    p = tmp_path / "etw.xml"
+    p.write_text(etw_xml(), encoding="utf-8")
+    full = w.parse_events_xml(p)
+    assert full == w.parse_events_xml(etw_xml())
+    only_proc = w.parse_events_xml(p, lambda r: r["provider"] == w.PROV_PROCESS)
+    assert only_proc and all(r["provider"] == w.PROV_PROCESS for r in only_proc)
+    assert len(only_proc) < len(full)
+
+
+def test_cmd_shim_gets_one_line_prompt(monkeypatch, tmp_path):
+    # npm's claude.cmd / codex.cmd run through cmd.exe, which stops at a newline.
+    from umbra_train import runner
+    from umbra_train.config import load_lab_config
+    from umbra_train.scenarios import load_all
+    lab = load_lab_config()
+    shim = str(tmp_path / "claude.cmd")
+    monkeypatch.setattr(runner.shutil, "which", lambda c: shim)
+    for sc in load_all().values():   # every real prompt must survive the shim
+        for name in ("claude_code", "codex"):
+            cmd = runner.build_command(lab.actors[name], sc, lab)
+            assert cmd[0] == shim
+            assert not any("\n" in a or "\r" in a for a in cmd)
+            assert any(sc.prompt.split()[0] in a and "sandboxed lab workspace" in a for a in cmd)

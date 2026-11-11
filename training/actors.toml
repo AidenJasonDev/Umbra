@@ -17,10 +17,17 @@ cmd = ["claude", "-p", "{prompt}", "--dangerously-skip-permissions",
 
 [actors.codex]
 kind = "agent"
-# Headless Codex CLI (the ChatGPT agent harness). --full-auto keeps Codex's own
-# seatbelt sandbox (writes limited to the workspace). Network is turned on so
-# pip/curl scenarios can run.
-cmd = ["codex", "exec", "--full-auto", "--skip-git-repo-check", "--json",
+# Headless Codex CLI (the ChatGPT agent harness). The workspace-write sandbox
+# limits writes to the workspace; approval_policy=never means nobody is asked
+# (what --full-auto used to mean; codex-cli 0.167 removed that flag). Network is
+# turned on so pip/curl scenarios can run. Values are unquoted on purpose: on
+# Windows `codex` is an npm .cmd shim, and cmd.exe mangles double quotes.
+# --ignore-user-config: run Codex with defaults, not the user's config.toml
+# (which may pin a model the CLI can't use, and load plugins/MCP servers that
+# add processes and traffic to the capture). Sign-in still comes from CODEX_HOME.
+cmd = ["codex", "exec", "--ignore-user-config", "--sandbox", "workspace-write",
+       "--skip-git-repo-check", "--json",
+       "-c", "approval_policy=never",
        "-c", "sandbox_workspace_write.network_access=true", "{prompt}"]
 
 [actors.human]
