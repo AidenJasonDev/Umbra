@@ -140,6 +140,13 @@ def filter_stream(lines, tracker: TreeTracker, out_tree, out_proc) -> dict:
                 stats["bad"] += 1
                 continue
             stats["proc"] += 1
+            if key == "exec":
+                # Env values can hold other programs' tokens and passwords. Keep
+                # only the variable names (the agent-env features need nothing
+                # more) and never write a value to disk.
+                body = ev["event"]["exec"]
+                body["env"] = [e.split("=", 1)[0] + "=" for e in (body.get("env") or [])]
+                line = json.dumps(ev, separators=(",", ":")).encode()
             if out_proc is not None:
                 out_proc.write(line if line.endswith(b"\n") else line + b"\n")
             if tracker.on_proc_event(key, ev):
@@ -152,17 +159,61 @@ def filter_stream(lines, tracker: TreeTracker, out_tree, out_proc) -> dict:
     return stats
 
 
+class SafeDir:
+    """Root writing into a directory the (unprivileged) user owns.
+
+    Anything running as that user, including the agent under test, could plant
+    symlinks there to trick root into writing to or chowning system files.
+    So the directory is opened O_NOFOLLOW and must be owned by the invoking
+    user and not group- or world-writable. Every file is created
+    O_CREAT|O_EXCL|O_NOFOLLOW relative to that directory fd, mode 0600. It's
+    handed to the user with fchown on the open fd, never chown by path.
+    """
+
+    def __init__(self, path: str, uid: int | None, gid: int | None):
+        self.path = os.path.abspath(path)
+        self.fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        st = os.fstat(self.fd)
+        if uid is not None and st.st_uid != uid:
+            raise RuntimeError(f"run dir {self.path} is not owned by uid {uid}")
+        if st.st_mode & 0o022:
+            raise RuntimeError(f"run dir {self.path} is group/world-writable")
+        self.uid, self.gid = uid, gid
+
+    def create(self, name: str, mode: str = "wb", buffering: int = -1):
+        if "/" in name:
+            raise ValueError(name)
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                     dir_fd=self.fd)
+        if self.uid is not None:
+            os.fchown(fd, self.uid, self.gid if self.gid is not None else -1)
+        return os.fdopen(fd, mode, buffering=buffering)
+
+    def open_read(self, name: str):
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+        return os.fdopen(fd, "rb")
+
+    def exists(self, name: str) -> bool:
+        try:
+            os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+
+
 class Sensor:
     def __init__(self, args):
         self.a = args
-        self.run_dir = os.path.abspath(args.run_dir)
-        self.log_f = open(os.path.join(self.run_dir, "sensor.log"), "a", buffering=1)
+        self.dir = SafeDir(args.run_dir, args.owner_uid, args.owner_gid)
+        self.run_dir = self.dir.path
+        self.log_f = self.dir.create("sensor.log", "w", buffering=1)
         self.tracker = TreeTracker(args.marker)
         self.es_proc = None
         self.tcp_proc = None
         self.es_thread = None
         self.es_stats: dict = {}
-        self.stopping = threading.Event()
+        self.stop_requested = threading.Event()  # set by signals / STOP file
+        self.stopping = threading.Event()        # guard: stop() runs once
 
     def log(self, msg: str):
         self.log_f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
@@ -174,7 +225,7 @@ class Sensor:
         self.es_proc = subprocess.Popen(
             ["/usr/bin/eslogger", *ES_EVENTS],
             stdout=subprocess.PIPE,
-            stderr=open(self.path("eslogger.stderr"), "wb"),
+            stderr=self.dir.create("eslogger.stderr"),
             # eslogger silently drops events from every process in its own
             # process group (see `man eslogger`). Give it a group of its own,
             # or it mutes the sensor, the runner, and anything they launch.
@@ -182,8 +233,8 @@ class Sensor:
         )
 
         def pump():
-            with open(self.path("fs_raw.jsonl"), "wb") as tree_f, \
-                    open(self.path("proc_all.jsonl"), "wb") as proc_f:
+            with self.dir.create("fs_raw.jsonl") as tree_f, \
+                    self.dir.create("proc_all.jsonl") as proc_f:
                 self.es_stats = filter_stream(iter(self.es_proc.stdout.readline, b""),
                                               self.tracker, tree_f, proc_f)
 
@@ -191,7 +242,7 @@ class Sensor:
         self.es_thread.start()
         time.sleep(1.5)
         if self.es_proc.poll() is not None:
-            err = open(self.path("eslogger.stderr"), "rb").read().decode(errors="replace")
+            err = self.dir.open_read("eslogger.stderr").read().decode(errors="replace")
             raise RuntimeError(
                 "eslogger exited immediately. It needs root, and the app that "
                 "launched it (Terminal, iTerm, VS Code...) needs Full Disk Access "
@@ -202,18 +253,36 @@ class Sensor:
         # pktap,all = every interface incl. loopback; writes pcapng with
         # per-packet process name/pid. 1600-byte snaplen keeps TLS ClientHello
         # (SNI, JA4) and DNS while dropping payload bulk. mDNS is just noise.
+        # `-w -`: tcpdump writes to a file we created safely, never a path of its own.
         self.tcp_proc = subprocess.Popen(
             ["/usr/sbin/tcpdump", "-i", "pktap,all", "-s", "1600", "-U", "-n",
-             "-w", self.path("net.pcapng"), "not (udp port 5353)"],
-            stdout=subprocess.DEVNULL,
-            stderr=open(self.path("tcpdump.stderr"), "wb"),
-            start_new_session=True,
+             "-w", "-", "not (udp port 5353)"],
+            stdout=self.dir.create("net.pcapng"),
+            stderr=self.dir.create("tcpdump.stderr"),
+            # Deliberately NOT a new session (unlike eslogger, which needs one
+            # to avoid muting): if the sensor is killed, Ctrl-C still reaches
+            # tcpdump, so a root capture is never left running.
         )
         time.sleep(1.0)
         if self.tcp_proc.poll() is not None:
-            err = open(self.path("tcpdump.stderr"), "rb").read().decode(errors="replace")
+            err = self.dir.open_read("tcpdump.stderr").read().decode(errors="replace")
             raise RuntimeError(f"tcpdump exited immediately:\n{err.strip()}")
         self.log("tcpdump running")
+
+    def drain(self, timeout: float = 15.0):
+        """eslogger's output can lag seconds behind on a busy machine. Before
+        stopping, wait until the root has been seen *and* has exited (plus a
+        short grace for its children), or until timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.es_proc is None or self.es_proc.poll() is not None:
+                return
+            t = self.tracker
+            if t.root is not None and t.root not in t.live:
+                time.sleep(1.0)
+                return
+            time.sleep(0.1)
+        self.log(f"drain timed out (root={self.tracker.root})")
 
     def stop(self):
         if self.stopping.is_set():
@@ -235,41 +304,39 @@ class Sensor:
             self.es_thread.join(timeout=30)
         summary = self.tracker.summary()
         summary["eslogger_stats"] = self.es_stats
-        with open(self.path("pids.json"), "w") as f:
+        with self.dir.create("pids.json", "w") as f:
             json.dump(summary, f, indent=2)
         self.log(f"stopped: {json.dumps(summary)[:400]}")
-        self.chown_outputs()
 
-    def chown_outputs(self):
-        uid, gid = self.a.owner_uid, self.a.owner_gid
-        if uid is None:
-            return
-        for name in os.listdir(self.run_dir):
-            try:
-                os.chown(self.path(name), uid, gid)
-            except OSError:
-                pass
+    def _kill_children(self):
+        for p in (self.tcp_proc, self.es_proc):
+            if p and p.poll() is None:
+                p.kill()
 
     def run(self):
-        signal.signal(signal.SIGTERM, lambda *_: self.stopping.set())
-        signal.signal(signal.SIGINT, lambda *_: self.stopping.set())
+        import atexit
+        atexit.register(self._kill_children)  # never leave root capture running
+        # Signals only *request* a stop. (They used to set the same flag stop()
+        # checks to run once, so Ctrl-C made stop() return without killing
+        # tcpdump, leaving a root capture running.)
+        signal.signal(signal.SIGTERM, lambda *_: self.stop_requested.set())
+        signal.signal(signal.SIGINT, lambda *_: self.stop_requested.set())
         try:
             if not self.a.no_fs:
                 self.start_eslogger()
             if not self.a.no_net:
                 self.start_tcpdump()
         except Exception as e:  # noqa: BLE001 - report any startup failure to the runner
-            with open(self.path("ERROR"), "w") as f:
+            with self.dir.create("ERROR", "w") as f:
                 f.write(str(e))
             self.log(f"ERROR {e}")
             self.stop()
             return 2
-        open(self.path("READY"), "w").close()
-        self.chown_outputs()
-        stop_file = self.path("STOP")
+        self.dir.create("READY").close()
         deadline = time.time() + self.a.max_seconds
-        while not self.stopping.is_set():
-            if os.path.exists(stop_file) or time.time() > deadline:
+        while not self.stop_requested.is_set():
+            if self.dir.exists("STOP") or time.time() > deadline:
+                self.drain()
                 break
             if self.es_proc and self.es_proc.poll() is not None:
                 self.log("eslogger died early")
@@ -283,11 +350,14 @@ def doctor(run_dir: str) -> int:
     """Self-test as root: can we see a marked exec in eslogger and attribute a
     packet to a pid with pktap? Prints a short report and leaves sample output
     in run_dir so parsers can be checked against real lines."""
-    os.makedirs(run_dir, exist_ok=True)
     ns = argparse.Namespace(run_dir=run_dir, marker="umbra-doctor-marker", no_fs=False,
                             no_net=False, max_seconds=30,
                             owner_uid=_env_int("SUDO_UID"), owner_gid=_env_int("SUDO_GID"))
-    s = Sensor(ns)
+    try:
+        s = Sensor(ns)
+    except (RuntimeError, OSError) as e:
+        print(f"FAIL  unsafe run directory: {e}")
+        return 2
     ok = True
     try:
         s.start_eslogger()
@@ -299,7 +369,7 @@ def doctor(run_dir: str) -> int:
     subprocess.run(["/bin/sh", "-c", 'exec "$@"', "umbra-doctor-marker",
                     "/usr/bin/curl", "-s", "-o", "/dev/null", "-m", "8",
                     "https://example.com/"])
-    time.sleep(2)
+    s.drain()
     s.stop()
     summ = s.tracker.summary()
     if summ["root"]:
@@ -309,10 +379,10 @@ def doctor(run_dir: str) -> int:
     else:
         ok = False
         print(f"FAIL  eslogger ran but never saw the marked exec. Stats: {s.es_stats}")
-    pcap = os.path.join(run_dir, "net.pcapng")
-    out = subprocess.run(["/usr/sbin/tcpdump", "-n", "-tt", "-q", "-k", "NPD", "-r", pcap],
-                         capture_output=True, text=True).stdout.splitlines()
-    with open(os.path.join(run_dir, "tcpdump_sample.txt"), "w") as f:
+    with s.dir.open_read("net.pcapng") as pcap:
+        out = subprocess.run(["/usr/sbin/tcpdump", "-n", "-tt", "-q", "-k", "NPD", "-r", "-"],
+                             stdin=pcap, capture_output=True, text=True).stdout.splitlines()
+    with s.dir.create("tcpdump_sample.txt", "w") as f:
         f.write("\n".join(out[:400]))
     curl_lines = [ln for ln in out if "curl" in ln]
     if curl_lines:
@@ -321,7 +391,6 @@ def doctor(run_dir: str) -> int:
         ok = False
         print(f"FAIL  no packets attributed to curl ({len(out)} packets total). "
               f"First line: {out[0][:160] if out else '(none)'}")
-    s.chown_outputs()
     return 0 if ok else 1
 
 
@@ -341,6 +410,7 @@ def main(argv=None) -> int:
     ap.add_argument("--owner-uid", type=int, default=_env_int("SUDO_UID"))
     ap.add_argument("--owner-gid", type=int, default=_env_int("SUDO_GID"))
     a = ap.parse_args(argv)
+    os.umask(0o077)  # anything root creates is private to its owner
     if os.geteuid() != 0:
         print("sensor must run as root (the runner starts it with sudo)", file=sys.stderr)
         return 2

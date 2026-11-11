@@ -46,6 +46,7 @@ class Actor:
     cmd: list[str] = field(default_factory=list)
     is_agent: bool = False
     env: dict = field(default_factory=dict)
+    isolated_home: str | None = None  # env var to point at a clean per-lab home
 
 
 @dataclass
@@ -65,5 +66,6 @@ def load_lab_config(path: Path = ACTORS_FILE) -> LabConfig:
             cmd=list(cmd),
             is_agent=a["kind"] == "agent",
             env=dict(a.get("env_windows") if (os.name == "nt" and "env_windows" in a) else a.get("env", {})),
+            isolated_home=a.get("isolated_home"),
         )
     return LabConfig(preamble=raw.get("lab", {}).get("preamble", "").strip(), actors=actors)

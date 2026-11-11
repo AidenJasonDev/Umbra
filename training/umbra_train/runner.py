@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 
 from . import ingest, tracker
-from .config import RUNS_DIR, SANDBOX_ROOT, SCRUB_ENV_PREFIXES, SENSOR_SCRIPT, Actor, LabConfig
+from .config import DATA_DIR, RUNS_DIR, SANDBOX_ROOT, SCRUB_ENV_PREFIXES, SENSOR_SCRIPT, Actor, LabConfig
 from .lab import Sink, looks_refused, make_workspace, run_checks
 from .scenarios import Scenario
 
@@ -69,6 +69,48 @@ class SudoKeeper:
 
     def stop(self):
         self._stop.set()
+
+
+def isolated_codex_home() -> Path:
+    """A clean CODEX_HOME for lab runs: only a link to the real auth.json, so
+    the login works but personal config, MCP servers, hooks and AGENTS.md
+    don't load."""
+    real = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    lab = SANDBOX_ROOT.parent / "codex-home"
+    lab.mkdir(parents=True, exist_ok=True)
+    os.chmod(lab, 0o700)
+    link = lab / "auth.json"
+    if (real / "auth.json").exists() and not link.exists():
+        link.symlink_to(real / "auth.json")
+    return lab
+
+
+def actor_version(actor: Actor) -> str:
+    if actor.kind != "agent" or not actor.cmd:
+        return ""
+    exe = shutil.which(actor.cmd[0]) or actor.cmd[0]
+    try:
+        p = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=20)
+        return (p.stdout or p.stderr).strip().splitlines()[0][:80]
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        return ""
+
+
+def agent_error(transcript: str) -> str | None:
+    """First fatal harness/API error in an agent's JSON output, if any."""
+    for line in transcript.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("type") == "result" and ev.get("is_error"):
+            return str(ev.get("result") or ev.get("terminal_reason"))[:200]
+        if ev.get("type") == "turn.failed":
+            return str((ev.get("error") or {}).get("message"))[:200]
+    return None
 
 
 def scrubbed_env(extra: dict | None = None) -> dict:
@@ -145,7 +187,7 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
     stamp = time.strftime("%Y%m%d-%H%M%S")
     run_id = f"{stamp}-{actor.name}-{sc.id.split('_')[0]}-r{rep}"
     run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    private_mkdir(run_dir)
     ws = make_workspace(SANDBOX_ROOT / run_id)
     marker = f"umbra-run-{uuid.uuid4().hex[:12]}"
     timeout_s = timeout_s or sc.timeout_s
@@ -154,10 +196,12 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
         "actor": actor.name, "actor_kind": actor.kind, "is_agent": int(actor.is_agent),
         "scenario": sc.id, "action_label": sc.label, "category": sc.category, "rep": rep,
         "workspace": str(ws), "marker": marker, "scope": sc.scope,
+        "actor_version": actor_version(actor),
         "captured": 0, "status": "ok", "notes": "",
     }
     sink.current_run = run_id
     sensor = None
+    interrupted = False
     try:
         if capture:
             sensor = start_sensor(run_dir, marker, timeout_s + 120)
@@ -173,8 +217,11 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
         m["t_start"] = time.time()
         detach = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS \
             else {"start_new_session": True}
+        extra_env = dict(actor.env)
+        if actor.isolated_home == "CODEX_HOME":
+            extra_env["CODEX_HOME"] = str(isolated_codex_home())
         p = subprocess.Popen(
-            cmd, cwd=ws, env=scrubbed_env(actor.env),
+            cmd, cwd=ws, env=scrubbed_env(extra_env),
             stdin=None if human else subprocess.DEVNULL,
             stdout=None if human else open(run_dir / "actor.out", "wb"),
             stderr=None if human else open(run_dir / "actor.err", "wb"),
@@ -186,6 +233,13 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
         except subprocess.TimeoutExpired:
             _kill_tree(p, own_session=True)
             m["status"], m["exit_code"] = "timeout", None
+        except KeyboardInterrupt:
+            # Agents run in their own session, so Ctrl-C doesn't reach them:
+            # kill the tree ourselves, then let `finally` stop the sensor.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)  # don't let a 2nd ^C skip cleanup
+            interrupted = True
+            _kill_tree(p, own_session=not human)
+            m["status"], m["exit_code"] = "interrupted", None
         m["t_end"] = time.time()
         m["duration_s"] = round(m["t_end"] - m["t_start"], 2)
         time.sleep(2)  # let trailing packets/events land
@@ -211,6 +265,7 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
             m["net_packets"] = (stats.get("net") or {}).get("kept", 0)
             m["net_stats"] = stats.get("net")
             _write_timeline(run_dir)
+            _drop_raw_captures(run_dir)
             pids = json.loads((run_dir / "pids.json").read_text()) if (run_dir / "pids.json").exists() else {}
             if not pids.get("root"):
                 m["status"] = "capture_failed"
@@ -225,16 +280,56 @@ def run_one(actor: Actor, sc: Scenario, lab: LabConfig, sink: Sink, rep: int = 1
         for name in ("actor.out", "actor.err"):
             if (run_dir / name).exists():
                 transcript += (run_dir / name).read_text(errors="replace")[-20000:]
+        err = agent_error(transcript) if actor.is_agent else None
+        if err and any(k in err.lower() for k in ("safeguard", "usage policy", "flagged")):
+            # The provider's safety layer blocked the request: that's a refusal,
+            # and a real agent behavior worth keeping, not a broken run.
+            m["notes"] = err[:300]
+            err = None
+            m["refused_by_provider"] = True
+        if err and m["status"] == "ok":
+            # Login expired, CLI too old, API down: the agent never really ran.
+            # Keep the run for the record but out of training.
+            m["status"] = "agent_error"
+            m["notes"] = (err or f"agent exited {m.get('exit_code')}")[:300]
         if m["checks_passed"] == m["checks_total"]:
             m["outcome"] = "completed"
-        elif actor.is_agent and looks_refused(transcript):
+        elif actor.is_agent and (m.get("refused_by_provider") or looks_refused(transcript)):
             m["outcome"] = "refused"
         else:
             m["outcome"] = "not_completed"
 
     (run_dir / "manifest.json").write_text(json.dumps(m, indent=2))
     tracker.upsert(m)
+    if interrupted:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        raise KeyboardInterrupt
     return m
+
+
+def private_mkdir(path: Path) -> None:
+    """Create path (inside DATA_DIR) so every level from DATA_DIR down is 0700."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DATA_DIR, 0o700)
+    cur = DATA_DIR
+    for part in path.relative_to(DATA_DIR).parts:
+        cur = cur / part
+        cur.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(cur, 0o700)
+
+
+def _drop_raw_captures(run_dir: Path) -> None:
+    """net.pcapng and proc_all.jsonl cover the whole machine (every app's
+    traffic headers, every program launched). Once the actor's slice is
+    normalized they aren't needed; keep them only when asked to."""
+    if os.environ.get("UMBRA_KEEP_RAW") == "1":
+        return
+    for name in ("net.pcapng", "proc_all.jsonl", "tcpdump_sample.txt", "etw.etl", "pktmon.etl",
+                 "etw.xml", "sec4688.xml"):
+        try:
+            (run_dir / name).unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _write_timeline(run_dir: Path) -> None:

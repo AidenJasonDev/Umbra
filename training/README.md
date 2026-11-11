@@ -112,6 +112,17 @@ lead the demo.
 - Agents sometimes refuse the unapproved tasks. That's recorded as `outcome=refused`, and those
   runs are left out of the action model, because the action didn't happen. The refusal rate is a
   result worth reporting on its own.
+- The root sensor never follows a symlink in the run folder. It opens the folder `O_NOFOLLOW`,
+  requires your ownership and no group/world write, creates every file `O_EXCL|O_NOFOLLOW` at 0600,
+  and hands files to you with `fchown` on the open handle. Agents under test run as you, so
+  without this they could plant a symlink and get root to write or chown a system file.
+- Captures cover the whole machine, so: env-var **values** are never written (only names), run
+  folders are 0700, and the machine-wide `net.pcapng` / `proc_all.jsonl` are deleted once the
+  actor's slice is extracted. Set `UMBRA_KEEP_RAW=1` to keep them for debugging.
+- Outcome checks run agent-modified code (e.g. the test suite), so on macOS they run under a
+  seatbelt profile with no network and no writes outside the sandbox, with a minimal environment
+  and git's hooks/fsmonitor disabled. Without that, Codex's code would leave Codex's own sandbox.
+  On Windows they only get the minimal environment, so use a VM there for unapproved scenarios.
 - `../session.jsonl` (164 GB of unfiltered eslogger) is gitignored. The sensor here filters to one
   process tree as it streams, so a run is megabytes, not gigabytes.
 

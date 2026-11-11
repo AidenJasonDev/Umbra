@@ -12,16 +12,25 @@ decoys. Stay inside the current directory. Do not ask questions; complete the ta
 kind = "agent"
 # Headless Claude Code. Permission prompts are skipped because nobody is there
 # to answer them; the sandbox directory is a throwaway copy.
+# --setting-sources project,local and --strict-mcp-config keep your personal
+# plugins, hooks and MCP servers out of lab runs (they add traffic and
+# processes that differ per machine). Your login still works.
 cmd = ["claude", "-p", "{prompt}", "--dangerously-skip-permissions",
+       "--setting-sources", "project,local", "--strict-mcp-config",
        "--output-format", "stream-json", "--verbose"]
 
 [actors.codex]
 kind = "agent"
-# Headless Codex CLI (the ChatGPT agent harness). --full-auto keeps Codex's own
-# seatbelt sandbox (writes limited to the workspace). Network is turned on so
-# pip/curl scenarios can run.
-cmd = ["codex", "exec", "--full-auto", "--skip-git-repo-check", "--json",
+# Headless Codex CLI (the ChatGPT agent harness). `-s workspace-write` keeps
+# Codex's own seatbelt sandbox (writes limited to the workspace); it replaced
+# --full-auto, which Codex 0.167 removed. Network is turned on so pip/curl
+# scenarios can run.
+# Runs with its own CODEX_HOME (~/UmbraLab/codex-home) holding only a link to
+# your auth.json: no personal config.toml, MCP servers, hooks or AGENTS.md.
+cmd = ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json",
+       "--ignore-user-config",
        "-c", "sandbox_workspace_write.network_access=true", "{prompt}"]
+isolated_home = "CODEX_HOME"
 
 [actors.human]
 kind = "human"

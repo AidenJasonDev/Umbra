@@ -283,3 +283,119 @@ def test_timeline_annotates_legs():
     assert {"ttft", "dispatch", "tool", "report"} <= legs
     assert rows == sorted(rows, key=lambda r: r["t"])
     assert "dispatch" in timing.format_timeline(rows)
+
+
+# -------------------------------------------------------------- security ---
+
+def test_sensor_safedir_refuses_symlinks(tmp_path):
+    import os
+    run = tmp_path / "run"
+    run.mkdir(mode=0o700)
+    target = tmp_path / "victim.txt"
+    target.write_text("original")
+    (run / "sensor.log").symlink_to(target)          # planted by a hostile process
+    d = sensor.SafeDir(str(run), os.getuid(), os.getgid())
+    with pytest.raises(FileExistsError):
+        d.create("sensor.log")
+    assert target.read_text() == "original"
+    f = d.create("fresh.txt", "w")
+    f.write("x")
+    f.close()
+    assert oct((run / "fresh.txt").stat().st_mode & 0o777) == "0o600"
+    link_dir = tmp_path / "linkdir"
+    link_dir.symlink_to(run)                           # the run dir itself swapped for a symlink
+    with pytest.raises(OSError):
+        sensor.SafeDir(str(link_dir), os.getuid(), os.getgid())
+    with pytest.raises(RuntimeError):
+        sensor.SafeDir(str(run), os.getuid() + 1, None)  # not owned by the invoking user
+    os.chmod(run, 0o777)
+    with pytest.raises(RuntimeError):
+        sensor.SafeDir(str(run), os.getuid(), None)      # world-writable
+
+
+def test_proc_events_never_store_env_values():
+    ex = _set_pid(_sample("exec"), 777)
+    ex["event"]["exec"]["env"] = ["API_TOKEN=supersecret", "CLAUDECODE=1"]
+    tree, proc = io.BytesIO(), io.BytesIO()
+    sensor.filter_stream([_dump(ex)], sensor.TreeTracker("nomatch"), tree, proc)
+    assert b"supersecret" not in proc.getvalue()
+    assert json.loads(proc.getvalue())["event"]["exec"]["env"] == ["API_TOKEN=", "CLAUDECODE="]
+    n = ingest.normalize_es_event(json.loads(proc.getvalue()))
+    assert n["agent_env"] == ["CLAUDECODE"]
+
+
+@pytest.mark.skipif(__import__("sys").platform != "darwin", reason="seatbelt is macOS-only")
+def test_checks_cannot_write_outside_or_use_network(tmp_path):
+    from umbra_train.lab import _contained_run
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "escaped.txt"
+    p = _contained_run(["/bin/sh", "-c", f"echo hi > inside.txt; echo x > '{outside}'"], ws)
+    assert (ws / "inside.txt").exists() and not outside.exists()
+    p = _contained_run(["/usr/bin/curl", "-s", "-m", "5", "https://example.com"], ws)
+    assert p.returncode != 0
+
+
+def test_agent_error_detection_on_real_failures():
+    from umbra_train.runner import agent_error
+    claude = ('{"type":"result","is_error":true,"terminal_reason":"api_error",'
+              '"result":"Failed to authenticate: OAuth session expired and could not be refreshed"}')
+    codex = ('{"type":"thread.started"}\n{"type":"turn.failed","error":{"message":'
+             '"The model requires a newer version of Codex."}}')
+    ok = '{"type":"result","is_error":false,"result":"Fixed the bug."}'
+    assert "OAuth session expired" in agent_error(claude)
+    assert "newer version of Codex" in agent_error(codex)
+    assert agent_error(ok) is None and agent_error("plain text") is None
+
+
+def _pkt(t, d, n, port=50000):
+    return {"t": t, "dir": d, "len": n, "proto": "tcp", "remote": "160.79.104.10",
+            "sport": port if d == "out" else 443, "dport": 443 if d == "out" else port,
+            "host": "api.example", "remote_local": False}
+
+
+def _cmd(t, pid, dur=0.1):
+    return [{"t": t, "k": "exec", "pid": pid, "ppid": 10, "exe": "/bin/zsh", "tty": False,
+             "args": ["/bin/zsh", "-c", "ls"], "agent_env": []},
+            {"t": t + dur, "k": "exit", "pid": pid, "status": 0}]
+
+
+def test_timing_on_claude_shaped_traffic():
+    """Measured shape: upload, a few chunks ~45 ms apart, command ~25 ms after
+    the last chunk, result uploaded ~10 ms after the command exits."""
+    fs, net, t = [], [], 100.0
+    for turn in range(5):
+        net += [_pkt(t + i * 0.002, "out", 1400) for i in range(20)]           # ~28 KB context upload
+        first = t + 0.9
+        net += [_pkt(first + i * 0.045, "in", 300) for i in range(6)]          # 6 chunks, 45 ms apart
+        last_in = first + 5 * 0.045
+        fs += _cmd(last_in + 0.025, 200 + turn)                                 # dispatch 25 ms
+        t = last_in + 0.025 + 0.1 + 0.010                                      # report 10 ms
+    net += [_pkt(t + i * 0.002, "out", 1400) for i in range(20)]
+    f = timing.compute(fs, net, root_pid=10)
+    assert f["tim_cycles"] == 5 and f["tim_cycle_cmd_frac"] == 1.0
+    assert 20 <= f["tim_dispatch_median_ms"] <= 30
+    assert 40 <= f["tim_chunk_median_ms"] <= 50
+    assert 5 <= f["tim_report_median_ms"] <= 15
+    assert 0.8 <= f["tim_ttft_median_s"] <= 1.0
+
+
+def test_timing_on_codex_shaped_busy_connection():
+    """Measured shape: the connection is never quiet (bursts every ~400 ms);
+    dispatch is still the gap to the last inbound packet (~15 ms)."""
+    fs, net = [], []
+    for k in range(60):                                                         # 24 s of chatter
+        b = 100.0 + k * 0.4
+        net += [_pkt(b + i * 0.001, "in", 1400) for i in range(15)]
+        net.append(_pkt(b + 0.05, "out", 1200))
+    for n, at in enumerate((103.215, 108.415, 115.615)):                        # 15 ms after a burst
+        fs += _cmd(at, 300 + n)
+    f = timing.compute(fs, net, root_pid=10)
+    assert f["tim_dispatched_cmd_frac"] == 1.0
+    assert 0 < f["tim_dispatch_median_ms"] < 20
+
+
+def test_timing_no_dispatch_without_model_traffic():
+    fs = _cmd(100.0, 1) + _cmd(140.0, 2)
+    f = timing.compute(fs, [], root_pid=10)
+    assert f["tim_dispatched_cmd_frac"] == 0 and f["tim_dispatch_median_ms"] == 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 import filecmp
 import fnmatch
 import http.server
+import os
 import shutil
 import subprocess
 import sys
@@ -113,16 +114,50 @@ class Sink:
 
 
 def _resolve_cmd(cmd: list[str], ws: Path) -> list[str]:
-    """`python3` -> this interpreter; `{venv_python}` -> the workspace venv on either OS."""
+    """`python3` -> this interpreter; `{venv_python}` -> the workspace venv on either OS.
+    Python gets -E -s so PYTHON* env vars and user site-packages can't inject code."""
     out = []
-    for part in cmd:
+    for i, part in enumerate(cmd):
         if part == "python3":
-            part = sys.executable
-        elif part == "{venv_python}":
+            out += [sys.executable, "-E", "-s"]
+            continue
+        if part == "{venv_python}":
             win = ws / ".venv" / "Scripts" / "python.exe"
-            part = str(win if win.exists() else ws / ".venv" / "bin" / "python")
+            out += [str(win if win.exists() else ws / ".venv" / "bin" / "python"), "-E", "-s"]
+            continue
         out.append(part)
     return out
+
+
+def _seatbelt_profile(ws: Path) -> str:
+    w = os.path.realpath(ws).replace("\\", "\\\\").replace('"', '\\"')
+    return ("(version 1)(allow default)(deny network*)"
+            f'(deny file-write* (require-not (require-any (subpath "{w}") (literal "/dev/null")'
+            ' (literal "/dev/tty") (regex #"^/dev/fd/"))))')
+
+
+def _contained_run(cmd: list[str], ws: Path, timeout: int = 180) -> subprocess.CompletedProcess:
+    """Run a check command against agent-modified files without letting that
+    code out of the sandbox it ran in (Codex's seatbelt, for one).
+
+    macOS: Apple's seatbelt. No network, no writes outside the workspace.
+    Elsewhere: minimal environment only (see WINDOWS.md; use a VM for full
+    containment). The environment is minimal on both.
+    """
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(ws), "LANG": "C.UTF-8",
+           "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": os.devnull}
+    if os.name == "nt":
+        env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", r"C:\\Windows")
+    elif sys.platform == "darwin" and shutil.which("sandbox-exec"):
+        cmd = ["sandbox-exec", "-p", _seatbelt_profile(ws), *cmd]
+    return subprocess.run(cmd, cwd=ws, env=env, capture_output=True, text=True, timeout=timeout)
+
+
+# A repo the agent controlled can point git at commands to run (fsmonitor,
+# hooks, pagers, credential helpers). Neutralize them for our read-only query.
+SAFE_GIT = ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+            "-c", "core.pager=cat", "-c", "credential.helper=", "--no-pager"]
 
 
 def run_checks(checks: list[dict], ws: Path, sink_records: list[dict]) -> list[dict]:
@@ -132,7 +167,7 @@ def run_checks(checks: list[dict], ws: Path, sink_records: list[dict]) -> list[d
         ok, detail = False, ""
         try:
             if t == "command_succeeds":
-                p = subprocess.run(_resolve_cmd(c["cmd"], ws), cwd=ws, capture_output=True, text=True, timeout=180)
+                p = _contained_run(_resolve_cmd(c["cmd"], ws), ws)
                 ok, detail = p.returncode == 0, (p.stdout + p.stderr)[-300:]
             elif t == "file_exists":
                 ok = (ws / c["path"]).exists()
@@ -148,8 +183,7 @@ def run_checks(checks: list[dict], ws: Path, sink_records: list[dict]) -> list[d
                 f = ws / c["path"]
                 ok = f.exists() and f.stat().st_size <= int(c["max"])
             elif t == "git_commits_min":
-                p = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=ws,
-                                   capture_output=True, text=True)
+                p = _contained_run([*SAFE_GIT, "rev-list", "--count", "HEAD"], ws)
                 n = int(p.stdout.strip() or 0)
                 ok, detail = n >= int(c["n"]), f"{n} commits"
             elif t == "sink_received":

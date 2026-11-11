@@ -15,7 +15,7 @@ from .lab import Sink
 
 def cmd_doctor(a):
     out = DATA_DIR / "doctor" / time.strftime("%Y%m%d-%H%M%S")
-    out.mkdir(parents=True, exist_ok=True)
+    runner.private_mkdir(out)
     if runner.IS_WINDOWS:
         from .capture import windows
         print("Checking the Windows sensors (ETW, Security 4688, pktmon). Needs an elevated prompt.\n")
@@ -65,6 +65,10 @@ def cmd_run(a):
                           f"({m.get('checks_passed')}/{m.get('checks_total')} checks), "
                           f"{m.get('duration_s')}s, fs={m.get('fs_events', '-')} pkts={m.get('net_packets', '-')}"
                           + (f"\n        note: {m['notes']}" if m.get("notes") else ""), flush=True)
+    except KeyboardInterrupt:
+        print("\nInterrupted. The agent was stopped, the sensor shut down, and the run was "
+              "recorded as 'interrupted' (excluded from training).")
+        return 130
     finally:
         sink.stop()
         if keeper:

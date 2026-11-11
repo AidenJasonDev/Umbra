@@ -7,11 +7,12 @@ at millisecond resolution.
 
 That lets us rebuild the agent loop and time each leg of it:
 
-    upload --ttft--> stream start --gen--> stream end --dispatch--> cmd start
+    upload --ttft--> response --gen--> last model packet --dispatch--> cmd start
         --tool--> cmd end --report--> next upload
 
 The key leg is **dispatch**: a harness starts the tool within milliseconds
-of the model's last token. A human, even one pasting from a chatbot, needs
+of the model's last packet (19-35 ms for Claude, 11-18 ms for Codex on the
+first real batch). A human, even one pasting from a chatbot, needs
 seconds and is irregular. Dispatch stays measurable after an attacker hides
 domains, env vars and binaries, because the model has to finish answering
 before the tool can run.
@@ -24,8 +25,9 @@ from __future__ import annotations
 import statistics
 from bisect import bisect_left, bisect_right
 
-DISPATCH_WINDOW_S = 5.0   # a command this soon after a stream ends counts as dispatched by it
+DISPATCH_WINDOW_S = 5.0   # a command this soon after model traffic counts as dispatched by it
 REPORT_WINDOW_S = 10.0    # an upload this soon after a command ends counts as reporting it
+RESPONSE_GAP_S = 0.3      # inbound silence that ends one response burst
 
 
 # ------------------------------------------------------------ primitives ---
@@ -42,47 +44,65 @@ def bursts(times: list[float], gap: float) -> list[tuple[float, float, int]]:
     return out
 
 
-def uploads(pkts: list[dict]) -> list[dict]:
-    """Outbound bursts (>=1 KB within 300 ms gaps) on non-local TLS flows.
-    One per agent 'turn': the harness sending context to the model."""
-    outs = sorted((p for p in pkts if p["dir"] == "out" and p["len"] > 0
-                   and not p.get("remote_local") and p["dport"] == 443), key=lambda p: p["t"])
-    res = []
-    times = [p["t"] for p in outs]
-    for s, e, _ in bursts(times, 0.3):
-        i, j = bisect_left(times, s), bisect_right(times, e)
-        size = sum(p["len"] for p in outs[i:j])
-        if size >= 1000:
-            hosts = {p.get("host") or p.get("remote") for p in outs[i:j]}
-            res.append({"t": s, "end": e, "bytes": size, "host": ",".join(sorted(h for h in hosts if h))})
-    return res
+def _model_flow(p: dict) -> bool:
+    """Non-local TLS: where a harness talks to its model (or anything HTTPS)."""
+    return not p.get("remote_local") and (p["dport"] if p["dir"] == "out" else p["sport"]) == 443
 
 
-def streams(pkts: list[dict]) -> list[dict]:
-    """Inbound token-stream trains: >=20 packets, 5-300 ms apart, per flow."""
+def _flow(p: dict) -> tuple:
+    """(remote address, local port): one TCP connection, either direction."""
+    return (p.get("remote"), p["sport"] if p["dir"] == "out" else p["dport"])
+
+
+def _per_flow(pkts: list[dict], direction: str) -> dict:
     flows: dict = {}
     for p in sorted(pkts, key=lambda p: p["t"]):
-        if p["dir"] == "in" and p["len"] > 0:
-            flows.setdefault((p.get("remote"), p["sport"], p["dport"]), []).append(p)
-    trains = []
-    for fp in flows.values():
-        cur = [fp[0]]
-        for prev, p in zip(fp, fp[1:]):
-            if 0.005 <= p["t"] - prev["t"] <= 0.3:
-                cur.append(p)
-            else:
-                if len(cur) >= 20:
-                    trains.append(cur)
-                cur = [p]
-        if len(cur) >= 20:
-            trains.append(cur)
-    out = []
-    for s in trains:
-        ia = [b["t"] - a["t"] for a, b in zip(s, s[1:])]
-        out.append({"t": s[0]["t"], "end": s[-1]["t"], "bytes": sum(p["len"] for p in s),
-                    "packets": len(s), "ia_median": statistics.median(ia),
-                    "host": s[0].get("host") or s[0].get("remote")})
-    return sorted(out, key=lambda s: s["t"])
+        if p["dir"] == direction and p["len"] > 0 and _model_flow(p):
+            flows.setdefault(_flow(p), []).append(p)
+    return flows
+
+
+def uploads(pkts: list[dict]) -> list[dict]:
+    """Outbound bursts (>=1 KB, 300 ms gaps) per connection: one per agent
+    'turn', the harness sending context to the model."""
+    res = []
+    for flow, ps in _per_flow(pkts, "out").items():
+        times = [p["t"] for p in ps]
+        for s, e, _ in bursts(times, 0.3):
+            i, j = bisect_left(times, s), bisect_right(times, e)
+            size = sum(p["len"] for p in ps[i:j])
+            if size >= 1000:
+                res.append({"t": s, "end": e, "bytes": size, "flow": flow,
+                            "host": ps[i].get("host") or ps[i].get("remote") or ""})
+    return sorted(res, key=lambda u: u["t"])
+
+
+def responses(pkts: list[dict]) -> list[dict]:
+    """Inbound bursts per connection, split by >300 ms of silence.
+
+    Measured on the first real batch: Claude's answers arrive as a handful of
+    chunks ~45 ms apart (the token cadence). Codex keeps one connection busy
+    with bursts every few hundred ms. An earlier rule ("20+ packets 5-300 ms
+    apart") matched neither, so there is no minimum size here. `chunk_ms` is
+    the median gap between chunks inside the burst (gaps of 5-300 ms only;
+    sub-5 ms gaps are TCP segments of one chunk)."""
+    res = []
+    for flow, ps in _per_flow(pkts, "in").items():
+        times = [p["t"] for p in ps]
+        for s, e, n in bursts(times, RESPONSE_GAP_S):
+            i, j = bisect_left(times, s), bisect_right(times, e)
+            gaps = [b - a for a, b in zip(times[i:j], times[i + 1:j]) if 0.005 <= b - a <= 0.3]
+            res.append({"t": s, "end": e, "bytes": sum(p["len"] for p in ps[i:j]), "packets": n,
+                        "chunk_ms": 1000 * statistics.median(gaps) if gaps else 0.0, "flow": flow,
+                        "host": ps[i].get("host") or ps[i].get("remote") or ""})
+    return sorted(res, key=lambda r: r["t"])
+
+
+streams = responses  # older name, still used by features.py
+
+
+def inbound_times(pkts: list[dict]) -> list[float]:
+    return sorted(p["t"] for p in pkts if p["dir"] == "in" and p["len"] > 0 and _model_flow(p))
 
 
 def commands(fs: list[dict], root_pid: int | None) -> list[dict]:
@@ -112,55 +132,64 @@ def _after(sorted_times: list[float], t: float, window: float) -> int | None:
 
 
 def _before(sorted_times: list[float], t: float, window: float) -> int | None:
-    """Index of the last time in [t - window, t], or None."""
-    i = bisect_right(sorted_times, t) - 1
+    """Index of the last time in [t - window, t), or None."""
+    i = bisect_left(sorted_times, t) - 1
     return i if i >= 0 and t - sorted_times[i] <= window else None
 
 
 # ---------------------------------------------------------------- cycles ---
 
 def cycles(fs: list[dict], net: list[dict], root_pid: int | None) -> dict:
-    """Rebuild the agent loop and time every leg. Returns lists of legs (s)."""
-    ups = uploads(net)
-    sts = streams(net)
-    cmds = commands(fs, root_pid)
-    up_t = [u["t"] for u in ups]
-    st_t = [s["t"] for s in sts]
-    cmd_t = [c["t"] for c in cmds]
-    cmd_end = sorted(c["end"] for c in cmds if c["end"] is not None)
+    """Rebuild the agent loop and time every leg (seconds).
 
-    legs = {"ttft": [], "gen": [], "dispatch": [], "tool": [], "report": [], "period": []}
+    dispatch = command start - last inbound model packet before it. Anchored on
+    the last packet, not a "stream end", because that's what survives both
+    Claude's chunky responses and Codex's always-busy connection.
+    """
+    ups = uploads(net)
+    resp = responses(net)
+    cmds = commands(fs, root_pid)
+    in_t = inbound_times(net)
+    up_t = [u["t"] for u in ups]
+    up_end = sorted(u["end"] for u in ups)
+    cmd_end = sorted(c["end"] for c in cmds if c["end"] is not None)
+    in_by_flow: dict = {}
+    for p in net:
+        if p["dir"] == "in" and p["len"] > 0 and _model_flow(p):
+            in_by_flow.setdefault(_flow(p), []).append(p["t"])
+    for v in in_by_flow.values():
+        v.sort()
+
+    legs = {"ttft": [], "gen": [], "dispatch": [], "tool": [], "report": [], "period": [], "chunk_ms": []}
     for u in ups:
-        k = _after(st_t, u["end"], 30.0)
+        k = _after(in_by_flow.get(u["flow"], []), u["end"], 30.0)
         if k is not None:
-            legs["ttft"].append(sts[k]["t"] - u["end"])
-    for s in sts:
-        legs["gen"].append(s["end"] - s["t"])
-        k = _after(cmd_t, s["end"], DISPATCH_WINDOW_S)
-        if k is not None:
-            legs["dispatch"].append(cmds[k]["t"] - s["end"])
+            legs["ttft"].append(in_by_flow[u["flow"]][k] - u["end"])
+    for r in resp:
+        legs["gen"].append(r["end"] - r["t"])
+        if r["chunk_ms"]:
+            legs["chunk_ms"].append(r["chunk_ms"])
+    complete = 0
     for c in cmds:
+        k = _before(in_t, c["t"], DISPATCH_WINDOW_S)
+        if k is not None:
+            c["dispatch"] = c["t"] - in_t[k]
+            legs["dispatch"].append(c["dispatch"])
         if c["end"] is not None:
             legs["tool"].append(c["end"] - c["t"])
+        # complete cycle: an upload before the answer, the answer dispatched
+        # this command, and the next upload reported its result
+        if k is not None and c["end"] is not None and _before(up_end, in_t[k], 30.0) is not None:
+            n = _after(up_t, c["end"] - 1e-9, REPORT_WINDOW_S)
+            if n is not None:
+                complete += 1
     for u in ups:
         k = _before(cmd_end, u["t"], REPORT_WINDOW_S)
         if k is not None:
             legs["report"].append(u["t"] - cmd_end[k])
     legs["period"] = [b - a for a, b in zip(up_t, up_t[1:])]
-
-    # A complete cycle: upload -> stream -> dispatched command -> reported by the next upload.
-    complete = 0
-    for i, u in enumerate(ups[:-1]):
-        k = _after(st_t, u["end"], 30.0)
-        if k is None:
-            continue
-        c = _after(cmd_t, sts[k]["end"], DISPATCH_WINDOW_S)
-        if c is None or cmds[c]["end"] is None:
-            continue
-        nxt = ups[i + 1]["t"]
-        if 0 <= nxt - cmds[c]["end"] <= REPORT_WINDOW_S:
-            complete += 1
-    return {"legs": legs, "complete": complete, "uploads": ups, "streams": sts, "commands": cmds}
+    return {"legs": legs, "complete": complete, "uploads": ups, "responses": resp,
+            "streams": resp, "commands": cmds, "inbound_times": in_t}
 
 
 # -------------------------------------------------------------- features ---
@@ -190,7 +219,6 @@ def compute(fs: list[dict], net: list[dict], root_pid: int | None) -> dict:
     c = cycles(fs, net, root_pid)
     L = c["legs"]
     cmds = c["commands"]
-    st_end = sorted(s["end"] for s in c["streams"])
     net_t = sorted(p["t"] for p in net if not p.get("remote_local"))
     quiet = sum(1 for x in cmds if _before(net_t, x["t"], 10.0) is None)
     return {
@@ -198,9 +226,11 @@ def compute(fs: list[dict], net: list[dict], root_pid: int | None) -> dict:
         "tim_cycle_cmd_frac": (c["complete"] / len(cmds)) if cmds else 0.0,
         "tim_ttft_median_s": _med(L["ttft"]),
         "tim_gen_median_s": _med(L["gen"]),
+        "tim_chunk_median_ms": _med(L["chunk_ms"]),
         "tim_dispatch_median_ms": 1000 * _med(L["dispatch"]),
+        "tim_dispatch_p90_ms": 1000 * (sorted(L["dispatch"])[int(0.9 * (len(L["dispatch"]) - 1))] if L["dispatch"] else 0.0),
         "tim_dispatch_cv": _cv(L["dispatch"]),
-        "tim_dispatched_cmd_frac": (sum(1 for x in cmds if _before(st_end, x["t"], DISPATCH_WINDOW_S) is not None) / len(cmds)) if cmds else 0.0,
+        "tim_dispatched_cmd_frac": (len(L["dispatch"]) / len(cmds)) if cmds else 0.0,
         "tim_report_median_ms": 1000 * _med(L["report"]),
         "tim_report_cv": _cv(L["report"]),
         "tim_period_median_s": _med(L["period"]),
@@ -218,25 +248,27 @@ def timeline(fs: list[dict], net: list[dict], root_pid: int | None) -> list[dict
     the dashboard and the demo video)."""
     c = cycles(fs, net, root_pid)
     rows = []
-    st_end = [s["end"] for s in c["streams"]]
     cmd_end = sorted(x["end"] for x in c["commands"] if x["end"] is not None)
-    up_end = [u["end"] for u in c["uploads"]]
+    up_end_by_flow: dict = {}
+    for u in c["uploads"]:
+        up_end_by_flow.setdefault(u["flow"], []).append(u["end"])
     for u in c["uploads"]:
         r = _before(cmd_end, u["t"], REPORT_WINDOW_S)
         rows.append({"t": u["t"], "src": "net", "what": "upload",
                      "detail": f"{u['bytes'] / 1024:.1f} KB -> {u['host'] or '?'}",
                      "leg": ("report", u["t"] - cmd_end[r]) if r is not None else None})
-    for s in c["streams"]:
-        u = _before(up_end, s["t"], 30.0)
-        rows.append({"t": s["t"], "src": "net", "what": "stream start",
-                     "detail": f"{s['packets']} pkts, {s['ia_median'] * 1000:.0f} ms apart",
-                     "leg": ("ttft", s["t"] - up_end[u]) if u is not None else None})
-        rows.append({"t": s["end"], "src": "net", "what": "stream end",
-                     "detail": f"{(s['end'] - s['t']):.1f} s of tokens", "leg": None})
+    for s_ in c["responses"]:
+        if s_["bytes"] < 200:
+            continue  # acks / keepalives
+        ue = up_end_by_flow.get(s_["flow"], [])
+        k = _before(ue, s_["t"], 30.0)
+        cad = f", chunks {s_['chunk_ms']:.0f} ms apart" if s_["chunk_ms"] else ""
+        rows.append({"t": s_["t"], "src": "net", "what": "response",
+                     "detail": f"{s_['bytes'] / 1024:.1f} KB in {s_['end'] - s_['t']:.2f} s{cad}",
+                     "leg": ("ttft", s_["t"] - ue[k]) if k is not None else None})
     for x in c["commands"]:
-        k = _before(st_end, x["t"], DISPATCH_WINDOW_S)
-        rows.append({"t": x["t"], "src": "fs", "what": "cmd start", "detail": x["argv"],
-                     "leg": ("dispatch", x["t"] - st_end[k]) if k is not None else None})
+        rows.append({"t": x["t"], "src": "fs", "what": "cmd start", "detail": x["argv"].replace("\n", " "),
+                     "leg": ("dispatch", x["dispatch"]) if "dispatch" in x else None})
         if x["end"] is not None:
             rows.append({"t": x["end"], "src": "fs", "what": "cmd end", "detail": "",
                          "leg": ("tool", x["end"] - x["t"])})
