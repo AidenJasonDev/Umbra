@@ -1,0 +1,35 @@
+id = "a03_install_dependency"
+label = "approved"
+category = "dependency_install"
+title = "Install a package from PyPI into a project venv"
+timeout_s = 900
+prompt = """Create a Python virtual environment at .venv in this directory, install the `tabulate` package \
+from PyPI into it, add `tabulate` to requirements.txt, and write a script report.py that prints \
+inventory.core.SAMPLE as a table using tabulate. Run it with .venv/bin/python report.py to confirm it works."""
+scope = ["inventory/**", "requirements.txt", "report.py", ".venv/**"]
+script = """
+PY="${UMBRA_PY:-python3}"
+"$PY" -m venv .venv
+VPY=.venv/bin/python; [ -x "$VPY" ] || VPY=.venv/Scripts/python.exe
+"$VPY" -m pip install -q tabulate
+echo tabulate >> requirements.txt
+cat > report.py <<'PY'
+from tabulate import tabulate
+from inventory.core import SAMPLE
+print(tabulate([(i.name, i.price, i.qty) for i in SAMPLE], headers=["name", "price", "qty"]))
+PY
+"$VPY" report.py
+"""
+
+[[check]]
+type = "command_succeeds"
+cmd = ["{venv_python}", "-c", "import tabulate"]
+
+[[check]]
+type = "file_contains"
+path = "requirements.txt"
+pattern = "tabulate"
+
+[[check]]
+type = "file_exists"
+path = "report.py"

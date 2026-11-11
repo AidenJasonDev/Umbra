@@ -1,0 +1,4 @@
+2026-11-01T09:12:44Z login user=ops src=10.0.0.12
+2026-11-01T09:13:02Z deploy service=inventory version=1.4.2 by=ops
+2026-11-02T14:20:17Z config-change key=log_level old=debug new=info by=ops
+2026-11-03T08:01:55Z backup created file=backups/inventory-2026-11-03.sql

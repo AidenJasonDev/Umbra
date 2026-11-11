@@ -1,0 +1,15 @@
+# Raw eslogger dumps are huge (session.jsonl is ~164 GB). Never commit them.
+session.jsonl
+*.pcap
+*.pcapng
+
+# Training run output (captures, sandboxes, tracker DB)
+training/data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.DS_Store

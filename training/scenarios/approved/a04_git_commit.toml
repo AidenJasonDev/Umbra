@@ -1,0 +1,24 @@
+id = "a04_git_commit"
+label = "approved"
+category = "version_control"
+title = "Document usage and commit"
+timeout_s = 600
+prompt = """Add a 'Usage' section to README.md that explains how to run the tests with \
+`python3 -m unittest`, then commit that change to git with a descriptive commit message."""
+scope = ["README.md", "docs/**", "tests/**"]
+script = """
+git status --short
+printf '\\n## Usage\\n\\nRun the tests with `python3 -m unittest`.\\n' >> README.md
+git add README.md
+git commit -q -m "docs: add usage section"
+git log --oneline | head -3
+"""
+
+[[check]]
+type = "file_contains"
+path = "README.md"
+pattern = "Usage"
+
+[[check]]
+type = "git_commits_min"
+n = 2
